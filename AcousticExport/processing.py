@@ -11,6 +11,7 @@ import pyproj
 from scipy.ndimage import convolve
 from scipy.signal import find_peaks
 from echopype.core import SONAR_MODELS
+from echopype.calibrate.calibrate_ek import CalibrateEK80
 from xml.etree import ElementTree
 import pickle
 import math
@@ -104,7 +105,7 @@ def best_bottom_candidate(calibrated: xarray.Dataset,
                           peak_threshold: float = -50.0,
                           maximum_dropouts: int = 2,
                           window_radius: int = 8,
-                          minimum_peak_asymmetry = -1.0
+                          minimum_peak_asymmetry=-1.0
                           ):
     """
 
@@ -168,7 +169,7 @@ def extract_bottom_line(calibrated: xarray.Dataset,
         cbs = cbs.isel(frequency=frequency_idx)
     else:
         cbs = cbs.sel(frequency=frequency)
-    #peaks = xarray.apply_ufunc(peak_wrapper, cbs, threshold, input_core_dims=[["range"], []], output_core_dims=[["range"]], vectorize=True)
+    # peaks = xarray.apply_ufunc(peak_wrapper, cbs, threshold, input_core_dims=[["range"], []], output_core_dims=[["range"]], vectorize=True)
     intensity_mask = cbs >= threshold if threshold is not None else cbs >= cbs.max()
     R = calibrated.range
     depth_mask = R >= min_depth
@@ -213,44 +214,53 @@ def clip_to_ranging(calibrated: xarray.Dataset, rmax):
     return calibrated.sel(range=slice(0, rmax))
 
 
-def angular_position(ed: ep.echodata.EchoData):
+def angular_position(split_r: xarray.DataArray, split_i: xarray.DataArray, angle_sensitivity_alongship: xarray.DataArray, angle_sensitivity_athwartship: xarray.DataArray):
     # split_r = ed.beam.backscatter_r.sel(frequency=ed.beam.frequency[ed.beam.beam_type==17])  # get the splitbeam transducers only
     # split_i = ed.beam.backscatter_i.sel(frequency=ed.beam.frequency[ed.beam.beam_type==17])
     # angle_sensitivity_alongship = ed.beam.angle_sensitivity_alongship.sel(frequency=ed.beam.frequency[ed.beam.beam_type == 17])
     # angle_sensitivity_athwartship = ed.beam.angle_sensitivity_athwartship.sel(frequency=ed.beam.frequency[ed.beam.beam_type == 17])
-    split_r = ed.beam.backscatter_r
-    split_i = ed.beam.backscatter_i
-    angle_sensitivity_alongship = ed.beam.angle_sensitivity_alongship
-    angle_sensitivity_athwartship = ed.beam.angle_sensitivity_athwartship
-    angle_offset_alongship = ed.beam.angle_offset_alongship
-    angle_offset_athwartship = ed.beam.angle_offset_athwartship
-    xstr = split_r.isel(quadrant=0)
+    # split_r = ed.beam.backscatter_r  # real component of backscatter complex data (64 bit float)
+    # split_i = ed.beam.backscatter_i  # imaginary component of backscatter complex data (64 bit float)
+    # angle_sensitivity_alongship = ed.beam.angle_sensitivity_alongship
+    # angle_sensitivity_athwartship = ed.beam.angle_sensitivity_athwartship
+
+    # angle_offset_alongship = ed.beam.angle_offset_alongship
+    # angle_offset_athwartship = ed.beam.angle_offset_athwartship
+    # According to data sheet for ES38-18/200-18C combination transducer
+    xstr = split_r.isel(quadrant=0)  # Starboard is first sector
     ystr = split_i.isel(quadrant=0)
-    xprt = split_r.isel(quadrant=1)
+    xprt = split_r.isel(quadrant=1)  # Port is second sector
     yprt = split_i.isel(quadrant=1)
-    xfwd = split_r.isel(quadrant=2)
+    xfwd = split_r.isel(quadrant=2)  # Forward is third sector
     yfwd = split_i.isel(quadrant=2)
-    electric_angle_alongship = xarray.ufuncs.arcsin(1 / (3 ** 0.5 * angle_sensitivity_alongship) *
-                                           (xarray.ufuncs.arctan2((xstr * yfwd - xfwd * ystr),
-                                                                  (xfwd * xstr + yfwd * ystr))
-                                            + xarray.ufuncs.arctan2((xprt * yfwd - xfwd * yprt),
-                                                                    (xfwd * xprt + yfwd * yprt))))
-    electric_angle_athwartship = xarray.ufuncs.arcsin(1 / angle_sensitivity_athwartship *
-                                             (xarray.ufuncs.arctan2((xprt * yfwd - xfwd * yprt),
-                                                                    (xfwd * xprt + yfwd * yprt))
-                                              - xarray.ufuncs.arctan2((xstr * yfwd - xfwd * ystr),
-                                                                      (xfwd * xstr + yfwd * ystr))))
-    #electric_angle_alongship = xarray.ufuncs.arcsin((2 / (3 ** 0.5) * 180 / 128 * electric_angle_alongship) / angle_sensitivity_alongship)
-    #electric_angle_alongship = 2 * xarray.ufuncs.arcsin((180 / 128 * electric_angle_alongship) / angle_sensitivity_alongship)
-    mechanical_angle_alongship = (2 / (3 ** 0.5) * electric_angle_alongship * 180 / math.pi / angle_sensitivity_alongship) - angle_offset_alongship
-    mechanical_angle_athwartship = (2 * electric_angle_athwartship * 180 / math.pi / angle_sensitivity_athwartship) - angle_offset_athwartship
+
+    mechanical_angle_alongship = xarray.ufuncs.arcsin(1 / (math.sqrt(3) * angle_sensitivity_alongship) *
+                                                      (
+                                                              xarray.ufuncs.arctan2((xstr * yfwd - xfwd * ystr),
+                                                                                    (xfwd * xstr + yfwd * ystr))
+                                                              +
+                                                              xarray.ufuncs.arctan2((xprt * yfwd - xfwd * yprt),
+                                                                                    (xfwd * xprt + yfwd * yprt))
+                                                      )
+                                                      )
+    mechanical_angle_athwartship = xarray.ufuncs.arcsin(1 / angle_sensitivity_athwartship *
+                                                        (
+                                                                xarray.ufuncs.arctan2((xprt * yfwd - xfwd * yprt),
+                                                                                      (xfwd * xprt + yfwd * yprt))
+                                                                -
+                                                                xarray.ufuncs.arctan2((xstr * yfwd - xfwd * ystr),
+                                                                                      (xfwd * xstr + yfwd * ystr))
+                                                        )
+                                                        )
+    # NO SPECIAL SCALING FOR COMPLEX DATA ?
     # angle_alongship_mech = xarray.ufuncs.arcsin(
     #     (2 / (3 ** 0.5) * 180 / 128 * angle_alongship) / angle_sensitivity_alongship) * 180 / math.pi
     # angle_athwartship_mech = xarray.ufuncs.arcsin(
     #     (2 * 180 / 128 * angle_athwartship) / angle_sensitivity_athwartship) * 180 / math.pi
-    ed.beam = ed.beam.assign({"angle_alongship": mechanical_angle_alongship,
-                              "angle_athwartship": mechanical_angle_athwartship})
-    return ed
+    # Convert to degrees
+    # ed.beam = ed.beam.assign({"angle_alongship": mechanical_angle_alongship * 180 / math.pi,
+    #                           "angle_athwartship": mechanical_angle_athwartship * 180 / math.pi})
+    return mechanical_angle_alongship * 180 / math.pi, mechanical_angle_athwartship * 180 / math.pi
 
 
 def interpolate_range(calibrated: xarray.Dataset):
@@ -400,22 +410,27 @@ def process_ed(file: str,
     # DO ALL THE THINGS NECESSARY WITH ED THEN DELETE ED
     ed = ep.open_raw(file, sonar_model=sonar_model)
     # Calculate angular position
-    ed = angular_position(ed)
+    mechanical_angle_alongship, mechanical_angle_athwartship = angular_position(ed.beam.backscatter_r, ed.beam.backscatter_i, ed.beam.angle_sensitivity_alongship, ed.beam.angle_sensitivity_athwartship)
+    ed.beam = ed.beam.assign({"angle_alongship": mechanical_angle_alongship * 180 / math.pi,
+                              "angle_athwartship": mechanical_angle_athwartship * 180 / math.pi})
     # Assign cruise distance and ping number as alternative coordinates
-    ed.beam = ed.beam.assign_coords({"ping_number": get_ping_number(ed.beam.ping_time, index_file),})
-                                     #"cruise_distance": fetch_cruise_distance(ed)})
+    ed.beam = ed.beam.assign_coords({"ping_number": get_ping_number(ed.beam.ping_time, index_file), })
+    # "cruise_distance": fetch_cruise_distance(ed)})
     # Extract calibration parameters
     cal_params = extract_calibration_xml(calibration_files)
     # Extract environment parameters
     env_params = extract_environment_xml(calibration_files)
     if backscatter is None:
-        Sp = ep.calibrate.compute_Sp(ed, waveform_mode=waveform_mode, encode_mode=encode_mode, env_params=env_params, cal_params=cal_params)
-        Sv = ep.calibrate.compute_Sv(ed, waveform_mode=waveform_mode, encode_mode=encode_mode, env_params=env_params, cal_params=cal_params)
+        Sp = ep.calibrate.compute_Sp(ed, waveform_mode=waveform_mode, encode_mode=encode_mode, env_params=env_params,
+                                     cal_params=cal_params)
+        Sv = ep.calibrate.compute_Sv(ed, waveform_mode=waveform_mode, encode_mode=encode_mode, env_params=env_params,
+                                     cal_params=cal_params)
         calibrated = xarray.combine_by_coords((Sp, Sv))
         del Sp, Sv
     else:
         # Get the calibrated calibrated/Sp
-        calibrated = ep.calibrate.api._compute_cal(backscatter, ed, waveform_mode=waveform_mode, encode_mode=encode_mode,
+        calibrated = ep.calibrate.api._compute_cal(backscatter, ed, waveform_mode=waveform_mode,
+                                                   encode_mode=encode_mode,
                                                    env_params=env_params, cal_params=cal_params)
     calibrated = calibrated.assign(fetch_latitude_longitude(ed))
     # TODO beam width alongship & athwartship
